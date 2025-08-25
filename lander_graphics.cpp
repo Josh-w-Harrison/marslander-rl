@@ -77,6 +77,14 @@
 #define DECLARE_GLOBAL_VARIABLES
 #include "lander.h"
 
+// In RL mode the graphics functions are not required.  Wrap the entire
+// contents of this file (except the physics helpers defined at the end)
+// in a guard so that OpenGL code is excluded when training.  The
+// definitions of atmospheric_density() and thrust_wrt_world() are
+// provided outside this guard specifically for RL mode.
+
+#ifndef RL_MODE
+
 void invert (double m[], double mout[])
   // Inverts a 4x4 OpenGL rotation matrix
 {
@@ -2209,3 +2217,103 @@ int main (int argc, char* argv[])
 
   glutMainLoop();
 }
+
+#endif // end of !RL_MODE guard for graphics functions
+
+// -------------------------------------------------------------------------
+// The following definitions are compiled only when RL_MODE is defined.
+// They provide minimal implementations of atmospheric_density() and
+// thrust_wrt_world() for the headless reinforcement learning build.
+
+#ifdef RL_MODE
+
+// Copy of the atmospheric density model from the original graphics file.
+// Computes a simple exponential density profile between the surface and
+// exosphere.  Surface density is approximately 0.017 kg/m^3 with a
+// scale height of roughly 11 km.  Returns zero outside the [0, EXOSPHERE]
+// altitude range.
+double atmospheric_density (vector3d pos)
+{
+  double alt = pos.abs() - MARS_RADIUS;
+  if ((alt > EXOSPHERE) || (alt < 0.0)) return 0.0;
+  else return (0.017 * exp(-alt/11000.0));
+}
+
+// Local implementation of xyz Euler angles to a rotation matrix.  This
+// reproduces the corresponding function from the graphics code but is
+// defined here so that thrust_wrt_world() can be computed in RL mode
+// without pulling in any OpenGL dependencies.
+static void rl_xyz_euler_to_matrix (vector3d ang, double m[])
+{
+  double sin_a, sin_b, sin_g, cos_a, cos_b, cos_g;
+  double ra = ang.x*M_PI/(double)180;
+  double rb = ang.y*M_PI/(double)180;
+  double rg = ang.z*M_PI/(double)180;
+  sin_a = sin(ra); cos_a = cos(ra);
+  sin_b = sin(rb); cos_b = cos(rb);
+  sin_g = sin(rg); cos_g = cos(rg);
+  m[0] = cos_a*cos_b;
+  m[1] = sin_a*cos_b;
+  m[2] = -sin_b;
+  m[3] = 0.0;
+  m[4] = cos_a*sin_b*sin_g - sin_a*cos_g;
+  m[5] = sin_a*sin_b*sin_g + cos_a*cos_g;
+  m[6] = cos_b*sin_g;
+  m[7] = 0.0;
+  m[8] = cos_a*sin_b*cos_g + sin_a*sin_g;
+  m[9] = sin_a*sin_b*cos_g - cos_a*sin_g;
+  m[10] = cos_b*cos_g;
+  m[11] = 0.0;
+  m[12] = 0.0;
+  m[13] = 0.0;
+  m[14] = 0.0;
+  m[15] = 1.0;
+}
+
+// Works out thrust vector in the world reference frame, given the
+// lander's orientation.  This implementation is a direct copy of the
+// corresponding function in the graphics build, with all OpenGL
+// dependencies removed.  It computes throttle lag, applies engine lag
+// filtering and returns the thrust vector.  The throttle history
+// handling via throttle_buffer is maintained.
+vector3d thrust_wrt_world (void)
+{
+  double m[16], k, delayed_throttle, lag = ENGINE_LAG;
+  vector3d a, b;
+  static double lagged_throttle = 0.0;
+  static double last_time_lag_updated = -1.0;
+
+  if (simulation_time < last_time_lag_updated) lagged_throttle = 0.0; // simulation restarted
+  if (throttle < 0.0) throttle = 0.0;
+  if (throttle > 1.0) throttle = 1.0;
+  if (landed || (fuel == 0.0)) throttle = 0.0;
+
+  if (simulation_time != last_time_lag_updated) {
+    // Delayed throttle value from the throttle history buffer
+    if (throttle_buffer_length > 0) {
+      delayed_throttle = throttle_buffer[throttle_buffer_pointer];
+      throttle_buffer[throttle_buffer_pointer] = throttle;
+      throttle_buffer_pointer = (throttle_buffer_pointer + 1) % throttle_buffer_length;
+    } else delayed_throttle = throttle;
+    // Lag, with time constant ENGINE_LAG
+    if (lag <= 0.0) k = 0.0;
+    else k = pow(exp(-1.0), delta_t/lag);
+    lagged_throttle = k*lagged_throttle + (1.0-k)*delayed_throttle;
+    last_time_lag_updated = simulation_time;
+  }
+  if (stabilized_attitude && (stabilized_attitude_angle == 0)) {
+    // Specific solution avoids rounding errors in the more general calculation below
+    b = lagged_throttle*MAX_THRUST*position.norm();
+  } else {
+    a.x = 0.0;
+    a.y = 0.0;
+    a.z = lagged_throttle*MAX_THRUST;
+    rl_xyz_euler_to_matrix(orientation, m);
+    b.x = m[0]*a.x + m[4]*a.y + m[8]*a.z;
+    b.y = m[1]*a.x + m[5]*a.y + m[9]*a.z;
+    b.z = m[2]*a.x + m[6]*a.y + m[10]*a.z;
+  }
+  return b;
+}
+
+#endif // RL_MODE

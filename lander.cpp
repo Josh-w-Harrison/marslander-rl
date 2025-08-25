@@ -14,10 +14,200 @@
 
 #include "lander.h"
 
+// The RL helpers below require std::vector for observation packing
+#include <vector>
+
 // Add at file scope (top of file, outside any function)
 static std::ofstream simlog;
 static bool simlog_initialized = false;
 static double sim_time = 0.0;
+
+// ========================================================================
+// RL utilities and helper functions
+//
+// When compiled in RL_MODE, these functions provide a small API for
+// interacting with the simulator without any reliance on OpenGL or GUI.
+// They compute observations, apply agent actions, perform physics
+// stepping, and reset the environment.  See lander.h for the
+// corresponding declarations.
+
+// Clamp a scalar to the given bounds.
+static inline double clampd(double x, double lo, double hi) {
+    return (x < lo ? lo : (x > hi ? hi : x));
+}
+
+// Current altitude above the surface in metres.
+static inline double altitude_m() {
+    return position.abs() - MARS_RADIUS;
+}
+
+// Compute the horizontal unit vectors used to derive a 2D heading.
+// 'er' is the outward radial unit vector at the lander's position.
+// Returns a pair (ex, ey) forming an orthonormal basis spanning
+// horizontal directions.  ex lies in the plane of world X-Y; ey = er × ex.
+static inline std::pair<vector3d, vector3d> horizontal_basis(const vector3d& er) {
+    // Start with world X axis projected onto the local tangent plane.
+    vector3d ex = vector3d(1.0, 0.0, 0.0) - (vector3d(1.0, 0.0, 0.0) * er) * er;
+    // If r is aligned with world X, fall back to Y axis.
+    if (ex.abs() < SMALL_NUM) {
+        ex = vector3d(0.0, 1.0, 0.0) - (vector3d(0.0, 1.0, 0.0) * er) * er;
+    }
+    ex = ex.norm();
+    vector3d ey = er ^ ex;
+    return {ex, ey};
+}
+
+// Build and return a normalised observation vector capturing the current
+// state of the lander.  The observation values are lightly scaled to
+// fall in a range roughly [-1, 1] for neural network consumption.
+std::vector<float> rl_observation() {
+    vector3d er = position.norm();
+    double h   = altitude_m();
+    // Vertical speed: +ve when moving away from the planet (upwards)
+    double vz  = velocity * er;
+    // Horizontal speed magnitude
+    vector3d vxyv = velocity - vz * er;
+    double vxy = vxyv.abs();
+    // Fuel fraction [0,1]
+    double fuel_frac = (FUEL_CAPACITY > 0.0) ? (fuel / FUEL_CAPACITY) : 0.0;
+
+    // 2D heading: direction of horizontal velocity on the local tangent plane.
+    double sin_h = 0.0, cos_h = 1.0;
+    if (vxy > SMALL_NUM) {
+        vector3d ex, ey;
+        auto bases = horizontal_basis(er);
+        ex = bases.first;
+        ey = bases.second;
+        vector3d dir = vxyv / vxy;
+        cos_h = dir * ex;
+        sin_h = dir * ey;
+    }
+    // Scaling constants to normalise inputs
+    const double H_SCALE   = 1.0 / 10000.0;  // 10 km maps to 1
+    const double V_SCALE   = 1.0 / 100.0;    // 100 m/s maps to 1
+    std::vector<float> obs;
+    obs.reserve(RL_OBS_SIZE);
+    obs.push_back(static_cast<float>(h * H_SCALE));
+    obs.push_back(static_cast<float>(vz * V_SCALE));
+    obs.push_back(static_cast<float>(vxy * V_SCALE));
+    obs.push_back(static_cast<float>(fuel_frac));
+    obs.push_back(static_cast<float>(throttle));
+    obs.push_back(static_cast<float>(sin_h));
+    obs.push_back(static_cast<float>(cos_h));
+    return obs;
+}
+
+// Apply a throttle (and optional torque) command from the agent.  The
+// throttle is clamped to [0,1].  Torque control is not yet supported;
+// attitude control remains stabilised by default.
+void rl_apply_action(float throttle_cmd, float torque_cmd) {
+    (void)torque_cmd; // unused
+    // Clamp throttle to valid range
+    throttle = clampd(static_cast<double>(throttle_cmd), 0.0, 1.0);
+    // Maintain stabilised attitude so that thrust points downwards
+    stabilized_attitude = true;
+    // Ensure the built-in autopilot does not override our command
+    autopilot_enabled = false;
+}
+
+// Take one physics step of duration dt and compute reward/termination.
+// Returns the reward for this step and sets 'done' to true when the
+// episode should terminate.
+float rl_step(double dt, bool &done) {
+    done = false;
+    // Temporarily override the global time step for this integration
+    double old_dt = delta_t;
+    delta_t = dt;
+    // Integrate one step; in RL mode Verlet is used via numerical_dynamics
+    numerical_dynamics();
+    // Restore original delta_t
+    delta_t = old_dt;
+
+    // Update the global simulation time accumulator for timeout checks
+    simulation_time += dt;
+
+    // Compute termination conditions and reward shaping
+    vector3d er = position.norm();
+    double h   = altitude_m();
+    double vz  = velocity * er;
+    vector3d vxyv = velocity - vz * er;
+    double vxy = vxyv.abs();
+
+    // Basic per-step penalties encourage the agent to descend smoothly
+    double reward = 0.0;
+    reward += -0.02 * h;             // encourage decreasing altitude
+    reward += -0.20 * std::abs(vz);  // penalise vertical speed
+    reward += -0.10 * vxy;           // penalise lateral speed
+    reward += -0.001 * throttle * throttle; // small penalty for fuel use
+
+    // Determine success or crash based on contact and velocities
+    bool success = false;
+    bool crash   = false;
+    const double touch_alt   = LANDER_SIZE * 0.5;
+    const double vz_safe     = MAX_IMPACT_DESCENT_RATE;
+    const double vxy_safe    = MAX_IMPACT_GROUND_SPEED;
+    if (h <= touch_alt) {
+        if (std::abs(vz) <= vz_safe && vxy <= vxy_safe) {
+            success = true;
+        } else {
+            crash = true;
+        }
+    }
+    if (success) {
+        reward += 1000.0;
+        done = true;
+    }
+    if (crash) {
+        reward -= 1000.0;
+        done = true;
+    }
+
+    // Timeout to prevent excessively long episodes
+    const double MAX_SIM_TIME = 2000.0; // seconds of simulated time
+    if (simulation_time >= MAX_SIM_TIME) {
+        done = true;
+    }
+    return static_cast<float>(reward);
+}
+
+// Reset the simulation to a randomised starting state.  The seed is
+// updated internally to produce deterministic sequences when desired.
+void rl_reset(unsigned seed) {
+    // Simple linear congruential generator for repeatability
+    auto urand = [&seed]() {
+        seed = 1664525u * seed + 1013904223u;
+        return seed;
+    };
+    // Random altitude between 5 km and 10 km
+    double H0  = 5000.0 + static_cast<double>(urand() % 5000);
+    // Random lateral offset up to ±2 km
+    double DX0 = ((urand() % 2) ? 1.0 : -1.0) * static_cast<double>(urand() % 2000);
+    // Initial descent rate between -50 and -100 m/s
+    double VZ0 = - (50.0 + static_cast<double>(urand() % 50));
+    // Initial lateral speed between -20 and 20 m/s
+    double VXY0 = static_cast<double>((urand() % 40)) - 20.0;
+
+    // Set position: offset in X and altitude along Y (world Y axis points up)
+    position = vector3d(DX0, -(MARS_RADIUS + H0), 0.0);
+    // Compute radial unit and tangent basis
+    vector3d er = position.norm();
+    auto bases = horizontal_basis(er);
+    vector3d ex = bases.first;
+    vector3d ey = bases.second;
+    // Set velocity: downward and lateral components
+    velocity = (-VZ0) * er + VXY0 * ex;
+    // Reset orientation so that thrust points downwards (body Z axis down)
+    orientation = vector3d(0.0, 90.0, 0.0);
+    // Zero throttle and full fuel
+    throttle = 0.0;
+    fuel = FUEL_CAPACITY;
+    // Reset attitude and parachute status
+    stabilized_attitude = true;
+    autopilot_enabled = false;
+    parachute_status = NOT_DEPLOYED;
+    // Reset simulation time counter used in rl_step()
+    simulation_time = 0.0;
+}
 
 // Predict perigiee (perigee) radius from current r, v (SI units).
 static double perigiee_radius(const vector3d& r, const vector3d& v)
@@ -292,10 +482,13 @@ void sim_logging() {
     sim_time += delta_t;
 }
 
-void numerical_dynamics(void)
+void numerical_dynamics (void)
+  // Perform the numerical integration to update position and velocity.
+  // This function respects the RL_MODE compile flag to disable logging and
+  // choose a cheaper integrator during headless reinforcement learning.
 {
+    // In GUI mode we open the simulation log on first call and write a header.
 #ifndef RL_MODE
-    // CSV logging (GUI runs only)
     if (!simlog_initialized) {
         simlog.open("lander_simulation.csv");
         simlog << "time,x,y,z,vx,vy,vz,altitude,throttle,v_target\n";
@@ -303,18 +496,20 @@ void numerical_dynamics(void)
     }
 #endif
 
+    // Select the integration scheme.  Verlet is cheap and stable for RL runs
+    // whereas RK4 provides higher accuracy for interactive play.
 #ifdef RL_MODE
-    // Fast, stable, cheap for RL
-    verlet_step(position, velocity, delta_t);
+    // Verlet integration uses the global delta_t internally
+    verlet_step();
 #else
-    // High-accuracy for GUI/play
     rk4_step(position, velocity, delta_t);
 #endif
 
+    // Apply autopilot control if enabled
     if (autopilot_enabled) autopilot();
+    // Apply attitude stabilisation if enabled
     if (stabilized_attitude) attitude_stabilization();
 }
-
 
 void initialize_simulation (void)
   // Lander pose initialization - selects one of 10 possible scenarios
@@ -426,4 +621,12 @@ void initialize_simulation (void)
     break;
 
   }
+  // Always (re)initialize logging after scenario selection
+  if (simlog.is_open()) {
+      simlog.close();
+  }
+  simlog.open("lander_simulation.csv");
+  simlog << "time,x,y,z,vx,vy,vz,altitude,throttle,v_target\n";
+  simlog_initialized = true;
+  sim_time = 0.0;
 }

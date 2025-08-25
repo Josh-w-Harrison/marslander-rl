@@ -19,10 +19,15 @@
 #include <sys/time.h>
 #include <unistd.h>
 #endif
+// Only include OpenGL headers in non-RL builds.  The RL_MODE compile
+// flag disables all rendering and GLUT usage so the simulator can be
+// compiled and run headlessly for reinforcement learning training.
+#ifndef RL_MODE
 #ifdef __APPLE__
 #include <GLUT/glut.h>
 #else
 #include <GL/glut.h>
+#endif
 #endif
 #include <iostream>
 #include <string>
@@ -30,6 +35,9 @@
 #include <fstream>
 #include <cmath>
 #include <cstdlib>
+
+// The RL helpers declared at the bottom of this header use std::vector
+#include <vector>
 
 // GLUT mouse wheel operations work under Linux only
 #if !defined (GLUT_WHEEL_UP)
@@ -141,13 +149,17 @@ enum parachute_status_t { NOT_DEPLOYED = 0, DEPLOYED = 1, LOST = 2 };
 
 #ifdef DECLARE_GLOBAL_VARIABLES // actual declarations of all global variables for lander_graphics.cpp
 
-// GL windows and objects
+// GL windows and objects.  These are only needed when compiling the GUI
+// visualisation.  In RL mode these are excluded to avoid referencing
+// OpenGL types when building without GLUT.
+#ifndef RL_MODE
 int main_window, closeup_window, orbital_window, instrument_window, view_width, view_height, win_width, win_height;
 GLUquadricObj *quadObj;
 GLuint terrain_texture;
 short throttle_control;
 track_t track;
 bool texture_available;
+#endif
 
 // Simulation parameters
 bool help = false;
@@ -181,11 +193,13 @@ double orbital_zoom, save_orbital_zoom, closeup_offset, closeup_xr, closeup_yr, 
 quat_t orbital_quat;
 
 // For GL lights
+#ifndef RL_MODE
 GLfloat plus_y[] = { 0.0, 1.0, 0.0, 0.0 };
 GLfloat minus_y[] = { 0.0, -1.0, 0.0, 0.0 };
 GLfloat plus_z[] = { 0.0, 0.0, 1.0, 0.0 };
 GLfloat top_right[] = { 1.0, 1.0, 1.0, 0.0 };
 GLfloat straight_on[] = { 0.0, 0.0, 1.0, 0.0 };
+#endif
 
 #else // extern declarations of those global variables used in lander.cpp
 
@@ -250,3 +264,38 @@ void closeup_mouse_button (int button, int state, int x, int y);
 void closeup_mouse_motion (int x, int y);
 void glut_special (int key, int x, int y);
 void glut_key (unsigned char k, int x, int y);
+
+// ========================================================================
+// Reinforcement Learning (RL) interface
+//
+// These helper functions expose a minimal API for interacting with the
+// simulator without any of the GLUT/OpenGL visualisation or user-input
+// infrastructure.  In RL mode the simulator runs headlessly and the
+// environment exposes observations, accepts actions and returns rewards
+// through these functions.  See lander.cpp for implementations.
+
+// Returns a vector of normalised observation values representing the
+// current state.  The default observation includes altitude, vertical
+// speed, lateral speed magnitude, remaining fuel fraction, current
+// throttle setting and a simple two-dimensional heading represented as
+// sine and cosine components.
+std::vector<float> rl_observation();
+
+// Applies the given throttle and optional torque command.  Throttle
+// commands are clamped to the range [0,1].  Torque commands are
+// currently ignored while the lander model has a stabilised attitude.
+void rl_apply_action(float throttle_cmd, float torque_cmd = 0.0f);
+
+// Advances the simulation by the specified time step (dt).  Returns
+// the reward obtained during this step and sets the done flag to true
+// when a terminal condition (safe landing, crash or timeout) occurs.
+float rl_step(double dt, bool &done);
+
+// Resets the simulation to a randomised initial state for training.  A
+// seed can be supplied to reproduce specific starting conditions.
+void rl_reset(unsigned seed = 0);
+
+// Observation and action sizes exposed for convenience to RL agents.
+constexpr int RL_OBS_SIZE = 7; // [alt, vz, |vxy|, fuel, throttle, sinψ, cosψ]
+constexpr int RL_ACT_SIZE = 1; // Only throttle is controllable currently
+
