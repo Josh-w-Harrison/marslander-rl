@@ -292,60 +292,29 @@ void sim_logging() {
     sim_time += delta_t;
 }
 
-void numerical_dynamics (void)
-  // This is the function that performs the numerical integration to update the
-  // The time step is delta_t (global variable).;
+void numerical_dynamics(void)
 {
-    // Initialize log file once
+#ifndef RL_MODE
+    // CSV logging (GUI runs only)
     if (!simlog_initialized) {
         simlog.open("lander_simulation.csv");
-        simlog << "time,x,y,z,vx,vy,vz,altitude,throttle,v_target\n"; // CSV header
+        simlog << "time,x,y,z,vx,vy,vz,altitude,throttle,v_target\n";
         simlog_initialized = true;
     }
+#endif
 
-// runge-kutte integration method
-rk4_step(position, velocity, delta_t);
+#ifdef RL_MODE
+    // Fast, stable, cheap for RL
+    verlet_step(position, velocity, delta_t);
+#else
+    // High-accuracy for GUI/play
+    rk4_step(position, velocity, delta_t);
+#endif
 
-
-// verlet integration method
-// verlet_step();
-
-
-// euler integration method
-// euler_step();
-
- /*
- // Compute altitude and v_target for logging
- double altitude = position.abs() - MARS_RADIUS;
- const double Kh = 0.01;
- double v_target;
- vector3d er = position.norm();
-
- if (altitude > 10000.0) {
-     v_target = velocity * er;
- }
- else {
-     v_target = -(0.5 + Kh * altitude);
- }
-
- // Log data only if file is open
- if (simlog.is_open()) {
-     simlog << sim_time << ","
-         << position.x << "," << position.y << "," << position.z << ","
-         << velocity.x << "," << velocity.y << "," << velocity.z << ","
-         << altitude << ","
-         << throttle << ","
-         << v_target << "\n";
- }
-
- sim_time += delta_t;
- */
- // Here we can apply an autopilot to adjust the thrust, parachute and attitude
- if (autopilot_enabled) autopilot();
-
- // Here we can apply 3-axis stabilization to ensure the base is always pointing downwards
- if (stabilized_attitude) attitude_stabilization();
+    if (autopilot_enabled) autopilot();
+    if (stabilized_attitude) attitude_stabilization();
 }
+
 
 void initialize_simulation (void)
   // Lander pose initialization - selects one of 10 possible scenarios
@@ -457,12 +426,4 @@ void initialize_simulation (void)
     break;
 
   }
-  // Always (re)initialize logging after scenario selection
-  if (simlog.is_open()) {
-      simlog.close();
-  }
-  simlog.open("lander_simulation.csv");
-  simlog << "time,x,y,z,vx,vy,vz,altitude,throttle,v_target\n";
-  simlog_initialized = true;
-  sim_time = 0.0;
 }
